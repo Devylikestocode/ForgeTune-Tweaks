@@ -1,7 +1,7 @@
 # ForgeTune - Windows optimization suite
 # Host: Windows PowerShell 5.1, STA (powershell.exe is STA by default)
 # Run locally:   powershell -NoProfile -ExecutionPolicy Bypass -STA -File .\ForgeTune.ps1
-# Run from web:  irm https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/ForgeTune.ps1 | iex
+# Run from web:  irm https://raw.githubusercontent.com/Devylikestocode/ForgeTune-Tweaks/main/ForgeTune.ps1 | iex
 # Every change is backed up first to:
 #   %LOCALAPPDATA%\ForgeTune\Ember-Rebuild\originals.json
 # Nothing is changed automatically; every change requires a click + confirm.
@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 
 # Raw URL of this script on GitHub. Used by "Restart as admin" when the script
 # was launched with "irm ... | iex" (no file on disk to relaunch).
-$script:FTSourceUrl = 'https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/ForgeTune.ps1'
+$script:FTSourceUrl = 'https://raw.githubusercontent.com/Devylikestocode/ForgeTune-Tweaks/main/ForgeTune.ps1'
 
 try {
     if ($env:OS -ne 'Windows_NT') { throw 'ForgeTune requires Windows.' }
@@ -217,6 +217,18 @@ namespace ForgeTune {
     }
 
     # ---------------------------------------------------------------- backup
+    function Get-FTBackupPath {
+        # Rebuild the data folder and file path on every call instead of trusting
+        # whatever is in the session hash. A blank path here is what produced:
+        #   Exception calling "Replace" with "3" argument(s):
+        #   "The path is not of a legal form."
+        if (-not $env:LOCALAPPDATA) { throw 'LOCALAPPDATA is not set; cannot locate the ForgeTune data folder.' }
+        $script:FT.Data = Join-Path $env:LOCALAPPDATA 'ForgeTune\Ember-Rebuild'
+        $script:FT.BackupFile = Join-Path $script:FT.Data 'originals.json'
+        [void][IO.Directory]::CreateDirectory($script:FT.Data)
+        return $script:FT.BackupFile
+    }
+
     function Test-FTBackup {
         param($Backup)
         if ($null -eq $Backup) { throw 'The backup is empty.' }
@@ -230,9 +242,9 @@ namespace ForgeTune {
         }
         if (-not $Backup.WallpaperSaved -and $Backup.Wallpaper) { throw 'The wallpaper backup flags are inconsistent.' }
         if ($Backup.Wallpaper) {
-            $full = [IO.Path]::GetFullPath($Backup.Wallpaper)
+            $full = [IO.Path]::GetFullPath([string]$Backup.Wallpaper)
             $parent = [IO.Path]::GetDirectoryName($full)
-            $expected = [IO.Path]::GetFullPath($script:FT.Data)
+            $expected = [IO.Path]::GetFullPath([string]$script:FT.Data)
             $leaf = [IO.Path]::GetFileName($full)
             if ($parent -ine $expected -or $leaf -notmatch '^original-[0-9a-f]{32}\.bmp$') {
                 throw 'Invalid saved wallpaper location.'
@@ -242,14 +254,17 @@ namespace ForgeTune {
 
     function Initialize-FTBackup {
         try {
-            [void][IO.Directory]::CreateDirectory($script:FT.Data)
+            [void](Get-FTBackupPath)
             if (Test-Path -LiteralPath $script:FT.BackupFile) {
                 $loaded = Get-Content -LiteralPath $script:FT.BackupFile -Raw | ConvertFrom-Json
                 Test-FTBackup $loaded
                 $loaded.Plans = @($loaded.Plans)
+                if ($null -eq $loaded.Tweaks) { $loaded.Tweaks = [pscustomobject]@{} }
                 $script:FT.Backup = $loaded
             }
             $script:FT.BackupReady = $true
+            $script:FT.BackupError = ''
+            Write-FTLog "Backup file: $script:FT.BackupFile"
         }
         catch {
             $script:FT.BackupReady = $false
@@ -259,15 +274,17 @@ namespace ForgeTune {
 
     function Save-FTBackup {
         if (-not $script:FT.BackupReady) { throw "Settings changes blocked: $($script:FT.BackupError)" }
+        $file = Get-FTBackupPath          # sets Data + BackupFile before validating
         Test-FTBackup $script:FT.Backup
         $temp = Join-Path $script:FT.Data ('save-{0}.tmp' -f [guid]::NewGuid().ToString('N'))
         try {
             $json = ConvertTo-Json -InputObject $script:FT.Backup -Depth 6
             [IO.File]::WriteAllText($temp, $json, [Text.UTF8Encoding]::new($true))
-            if ([IO.File]::Exists($script:FT.BackupFile)) { [IO.File]::Replace($temp, $script:FT.BackupFile, $null) }
-            else { [IO.File]::Move($temp, $script:FT.BackupFile) }
+            [IO.File]::Copy($temp, $file, $true)   # overwrite; works on every volume
         }
-        finally { if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) } }
+        finally {
+            if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) }
+        }
     }
 
     function Get-FTTweakBackupCount {
@@ -281,6 +298,7 @@ namespace ForgeTune {
             $script:FT.UI.BackupInfo.Text = "BACKUP UNAVAILABLE - changes blocked.`r`n" + $script:FT.BackupError
             return
         }
+        try { [void](Get-FTBackupPath) } catch { Write-FTLog $_.Exception.Message }
         $b = $script:FT.Backup
         $r = [ForgeTune.Row]::new(); $r.Name = 'Original power plan'; $r.Category = 'power'
         if ($b.Power) { $r.Detail = $b.Power; $r.Status = 'saved' } else { $r.Detail = 'Not captured yet'; $r.Status = 'empty' }
@@ -652,6 +670,7 @@ namespace ForgeTune {
         if (-not $script:FT.BackupReady) { throw "Backup unavailable: $($script:FT.BackupError)" }
         if (-not [IO.File]::Exists($script:FT.ImagePath)) { throw 'The selected image no longer exists.' }
         if (-not (Confirm-FT 'Apply this image as your desktop wallpaper? Recovery preserves one static image only (not slideshow or Spotlight).')) { return }
+        [void](Get-FTBackupPath)
         if (-not $script:FT.Backup.WallpaperSaved) {
             $current = Get-FTCurrentWallpaper
             $original = ''
@@ -675,6 +694,7 @@ namespace ForgeTune {
     # ---------------------------------------------------------------- restore
     function Restore-FT {
         if (-not $script:FT.BackupReady) { throw "Backup unavailable: $($script:FT.BackupError)" }
+        [void](Get-FTBackupPath)
         $b = $script:FT.Backup
         if (-not $b.Power -and -not $b.WallpaperSaved -and -not @($b.Plans).Count -and -not (Get-FTTweakBackupCount)) {
             Write-FTLog 'There are no saved originals to restore.'; return
@@ -749,16 +769,16 @@ namespace ForgeTune {
         if (-not (Confirm-FT 'Relaunch ForgeTune with administrator rights? This window will close.')) { return }
         if ($PSCommandPath) {
             # Launched from a file on disk
-            $args = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`""
+            $arguments = "-NoProfile -ExecutionPolicy Bypass -STA -File `"$PSCommandPath`""
         }
         else {
             # Launched via "irm ... | iex" - re-download and run from the source URL
             if (-not $script:FTSourceUrl -or $script:FTSourceUrl -like '*YOUR_USER*') {
                 throw 'ForgeTune was started with irm | iex but $script:FTSourceUrl is not set. Edit the URL at the top of the script.'
             }
-            $args = "-NoProfile -ExecutionPolicy Bypass -STA -Command `"irm '$($script:FTSourceUrl)' | iex`""
+            $arguments = "-NoProfile -ExecutionPolicy Bypass -STA -Command `"irm '$($script:FTSourceUrl)' | iex`""
         }
-        Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $args -Verb RunAs | Out-Null
+        Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $arguments -Verb RunAs | Out-Null
         $script:FT.Window.Close()
     }
 
